@@ -11,16 +11,23 @@ import (
 )
 
 const (
-	defaultLogFilename    = "dcrtippin.log"
-	defaultConfigFilename = "dcrtippin.conf"
-	defaultLogLevel       = "info"
-	defaultLndNode        = "localhost:10009"
-	defaultBindAddr       = ":8000"
-	defaultUseLeHTTPS     = false
+	defaultTLSCertFilename  = "tls.cert"
+	defaultMacaroonFilename = "admin.macaroon"
+	defaultLogFilename      = "dcrtippin.log"
+	defaultConfigFilename   = "dcrtippin.conf"
+	defaultLogLevel         = "info"
+	defaultLndNode          = "localhost:10009"
+	defaultBindAddr         = ":8000"
+	defaultUseLeHTTPS       = false
 )
 
 var (
-	lndHomeDir     = dcrutil.AppDataDir("dcrlnd", false)
+	lndHomeDir          = dcrutil.AppDataDir("dcrlnd", false)
+	tlsCertPath         = filepath.Join(lndHomeDir, defaultTLSCertFilename)
+	defaultMacaroonPath = filepath.Join(
+		lndHomeDir, "data", "chain", "decred", "testnet",
+		defaultMacaroonFilename,
+	)
 	defaultDataDir = dcrutil.AppDataDir("dcrtippin", false)
 	defaultLogPath = filepath.Join(
 		defaultDataDir, "logs", "decred", "testnet",
@@ -32,6 +39,7 @@ var (
 )
 
 type config struct {
+	LndNode    string `long:"lnd_node" description:"network address of dcrlnd RPC (host:port)"`
 	BindAddr   string `long:"bind_addr" description:"port to listen for http"`
 	UseLeHTTPS bool   `long:"use_le_https" description:"use https via lets encrypt"`
 	Domain     string `long:"domain" description:"the domain of the faucet, required for TLS"`
@@ -40,6 +48,7 @@ type config struct {
 func loadConfig() (*config, []string, error) {
 	// Default config.
 	cfg := config{
+		LndNode:    defaultLndNode,
 		BindAddr:   defaultBindAddr,
 		UseLeHTTPS: defaultUseLeHTTPS,
 	}

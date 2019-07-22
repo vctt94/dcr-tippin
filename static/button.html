@@ -1,0 +1,16 @@
+{{template "header" .}}
+
+<div class="content mb-3 p-4">
+  <div class="justify-content-center">
+    <div>
+      <a class="tip-button" target="_blank" rel="noopener noreferrer" href="localhost:8000/">
+        Tip me
+      </a>
+    </div>
+    <div>
+      My pubkey starts with <code>{{ .NodePubkey }}</code>
+    </div>
+  </div>
+</div>
+
+{{template "footer" .}}

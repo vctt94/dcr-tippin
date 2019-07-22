@@ -61,12 +61,18 @@ func main() {
 		Funcs(customFuncs).
 		ParseGlob(templateGlobPattern))
 
-	template := newTemplate(faucetTemplates)
+	faucet, err := newLightningClient(cfg.LndNode, tlsCertPath, defaultMacaroonPath, faucetTemplates)
+	if err != nil {
+		log.Criticalf("unable to create faucet: %v", err)
+		os.Exit(1)
+		return
+	}
 
 	// Create a new mux in order to route a request based on its path to a
 	// dedicated http.Handler.
 	r := mux.NewRouter()
-	r.HandleFunc("/", template.faucetHome).Methods("POST", "GET")
+	r.HandleFunc("/", faucet.faucetHome).Methods("POST", "GET")
+	r.HandleFunc("/button", faucet.renderButton).Methods("POST", "GET")
 
 	// Next create a static file server which will dispatch our static
 	// files. We rap the file sever http.Handler is a handler that strips

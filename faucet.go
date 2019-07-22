@@ -1,12 +1,14 @@
 package main
 
 import (
-	"crypto/x509"
 	"fmt"
 	"html/template"
 	"io/ioutil"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -156,28 +158,28 @@ type lightningFaucet struct {
 	openChanMtx sync.RWMutex
 }
 
-func newTemplate(templates *template.Template) *lightningFaucet {
-	return &lightningFaucet{
-		templates: templates,
-		homePageContext: &homePageContext{
-			FormFields:            make(map[string]string),
-			GenerateInvoiceAction: GenerateInvoiceAction,
-		},
-	}
-}
-
 // newLightningClient creates a new channel faucet that's bound to a cluster of
 // lnd nodes, and uses the passed templates to render the web page.
-func newLightningClient(lndNode string, tlsCert *x509.CertPool, macBytes []byte, l *lightningFaucet) error {
+func newLightningClient(
+	lndNode, tlsCertPath, macaroonPath string, templates *template.Template) (
+	*lightningFaucet, error) {
 
 	// First attempt to establish a connection to lnd's RPC sever.
-	creds := credentials.NewClientTLSFromCert(tlsCert, "")
+	creds, err := credentials.NewClientTLSFromFile(tlsCertPath, "")
+	if err != nil {
+		return nil, fmt.Errorf("unable to read cert file: %v", err)
+	}
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
 
 	// Load the specified macaroon file.
+	macPath := cleanAndExpandPath(macaroonPath)
+	macBytes, err := ioutil.ReadFile(macPath)
+	if err != nil {
+		return nil, err
+	}
 	mac := &macaroon.Macaroon{}
-	if err := mac.UnmarshalBinary(macBytes); err != nil {
-		return err
+	if err = mac.UnmarshalBinary(macBytes); err != nil {
+		return nil, err
 	}
 
 	// Now we append the macaroon credentials to the dial options.
@@ -186,16 +188,38 @@ func newLightningClient(lndNode string, tlsCert *x509.CertPool, macBytes []byte,
 		grpc.WithPerRPCCredentials(macaroons.NewMacaroonCredential(mac)),
 	)
 
-	// opts := grpc.WithPerRPCCredentials(macaroons.NewMacaroonCredential(mac))
 	conn, err := grpc.Dial(lndNode, opts...)
 	if err != nil {
-		return fmt.Errorf("unable to dial to lnd's gRPC server: %v", err)
+		return nil, fmt.Errorf("unable to dial to lnd's gRPC server: %v", err)
 	}
 
+	// If we're able to connect out to the lnd node, then we can start up
+	// the faucet safely.
 	lnd := lnrpc.NewLightningClient(conn)
 
-	l.lnd = lnd
-	return nil
+	return &lightningFaucet{
+		lnd:       lnd,
+		templates: templates,
+		homePageContext: &homePageContext{
+			FormFields:            make(map[string]string),
+			GenerateInvoiceAction: GenerateInvoiceAction,
+		},
+	}, nil
+}
+
+// cleanAndExpandPath expands environment variables and leading ~ in the passed
+// path, cleans the result, and returns it.
+// This function is taken from https://github.com/btcsuite/btcd
+func cleanAndExpandPath(path string) string {
+	// Expand initial ~ to OS specific home directory.
+	if strings.HasPrefix(path, "~") {
+		homeDir := filepath.Dir(lndHomeDir)
+		path = strings.Replace(path, "~", homeDir, 1)
+	}
+
+	// NOTE: The os.ExpandEnv doesn't work with Windows-style %VARIABLE%,
+	// but the variables can still be expanded via POSIX-style $VARIABLE.
+	return filepath.Clean(os.ExpandEnv(path))
 }
 
 // homePageContext defines the initial context required for rendering home
@@ -223,6 +247,9 @@ type homePageContext struct {
 
 	// GenerateInvoiceAction indicates the form action to generate a new Invoice
 	GenerateInvoiceAction string
+
+	// Node pubkey
+	NodePubkey string
 }
 
 // faucetHome renders the main home page for the faucet. This includes the form
@@ -265,6 +292,46 @@ func (l *lightningFaucet) faucetHome(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
+// faucetHome renders the main home page for the faucet. This includes the form
+// to create channels, the network statistics, and the splash page upon channel
+// success.
+//
+// NOTE: This method implements the http.Handler interface.
+func (l *lightningFaucet) renderButton(w http.ResponseWriter, r *http.Request) {
+	// First obtain the home template from our cache of pre-compiled
+	// templates.
+	homeTemplate := l.templates.Lookup("button.html")
+
+	// In order to render the home template we'll need the necessary
+	// context, so we'll grab that from the lnd daemon now in order to get
+	// the most up to date state.
+	homeInfoContext := l.homePageContext
+
+	// If the method is GET, then we'll render the home page with the form
+	// itself.
+	switch {
+	case r.Method == http.MethodGet:
+		homeTemplate.Execute(w, homeInfoContext)
+
+	// Otherwise, if the method is POST, then the user is submitting the
+	// form to open a channel, so we'll pass that off to the openChannel
+	// handler.
+	case r.Method == http.MethodPost:
+		action, _ := r.URL.Query()["action"]
+
+		if action[0] == GenerateInvoiceAction {
+			l.generateInvoice(homeTemplate, homeInfoContext, w, r)
+		}
+
+	// If the method isn't either of those, then this is an error as we
+	// only support the two methods above.
+	default:
+		http.Error(w, "", http.StatusMethodNotAllowed)
+	}
+
+	return
+}
+
 // generateInvoice is a hybrid http.Handler that handles: the validation of the
 // generate invoice form, rendering errors to the form, and finally generating
 // invoice if all the parameters check out.
@@ -272,38 +339,9 @@ func (l *lightningFaucet) generateInvoice(homeTemplate *template.Template,
 	homeState *homePageContext, w http.ResponseWriter, r *http.Request) {
 
 	elapsed := time.Since(lastGeneratedInvoiceTime)
-	lndNode := r.FormValue("nodeurl")
 	amt := r.FormValue("amt")
 	description := r.FormValue("description")
-	tlsCert, _, err := r.FormFile("tlscert")
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	// read all of the contents of our uploaded file into a
-	// byte array
-	fileBytes, err := ioutil.ReadAll(tlsCert)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	cert := x509.NewCertPool()
-	cert.AppendCertsFromPEM(fileBytes)
-	defer tlsCert.Close()
 
-	adminMacaroon, _, err := r.FormFile("adminmacaroon")
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	macBytes, err := ioutil.ReadAll(adminMacaroon)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	defer adminMacaroon.Close()
-
-	homeState.FormFields["LndNode"] = lndNode
 	homeState.FormFields["Amt"] = amt
 	homeState.FormFields["Description"] = description
 
@@ -333,15 +371,6 @@ func (l *lightningFaucet) generateInvoice(homeTemplate *template.Template,
 		return
 	}
 	amtAtoms := int64(amtDcr * 1e8)
-
-	// Create a new lightning client with the inputs submited
-	err = newLightningClient(lndNode, cert, macBytes, l)
-	if err != nil {
-		log.Errorf("Generate invoice failed: %v", err)
-		homeState.SubmissionError = ErrorGeneratingInvoice
-		homeTemplate.Execute(w, homeState)
-		return
-	}
 
 	// generate new invoice
 	invoiceReq := &lnrpc.Invoice{
